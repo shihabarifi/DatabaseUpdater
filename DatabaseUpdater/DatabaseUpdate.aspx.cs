@@ -137,6 +137,8 @@ namespace DatabaseUpdater
                     ShowMessage("لا توجد تحديثات مطلوبة أو الإصدار المحدد أقل من الإصدار الحالي", false);
                     return;
                 }
+                var backupManager = new DatabaseBackupManager("Data Source=OZARK;Initial Catalog=MaalDB;Integrated Security=True;Connect Timeout=30;Encrypt=False;");
+                string backupPath = null;
 
                 using (SqlConnection conn = new SqlConnection(ConfigurationManager.ConnectionStrings["DefaultConnection"].ConnectionString))
                 {
@@ -149,12 +151,15 @@ namespace DatabaseUpdater
 
                     try
                     {
+                        // إنشاء نسخة احتياطية قبل بدء التحديث
+                        backupPath = backupManager.CreateBackup($"Before_Update_{currentVersion}_to_{targetVersion}");
                         foreach (string scriptVersion in updateScripts)
                         {
                             using (SqlTransaction transaction = conn.BeginTransaction())
                             {
                                 try
                                 {
+
                                     // تنفيذ السكربت
                                     ExecuteUpdateScript(scriptVersion, conn, transaction);
 
@@ -174,30 +179,60 @@ namespace DatabaseUpdater
                                 }
                                 catch (Exception ex)
                                 {
-                                    transaction.Rollback();
-                                    hasError = true;
-                                    errorMessage = $"فشل في تنفيذ السكربت {scriptVersion}: {ex.Message}";
-                                    LogScriptExecution(scriptVersion, false, errorMessage, conn, null);
-                                    break;
+                                    transaction.Commit();
+                                    //hasError = true;
+                                    //LogScriptExecution(scriptVersion, false, errorMessage, conn, null);
+                                    conn.Close();
+                                    throw new Exception($"فشل في تنفيذ السكربت {scriptVersion}: {ex.Message}");
                                 }
                             }
                         }
 
-                        if (hasError)
-                        {
-                            // إذا حدث خطأ، نحاول التراجع عن التحديثات السابقة
-                            RollbackUpdates(appliedScripts, conn);
-                            ShowMessage($"حدث خطأ أثناء التحديث: {errorMessage}", false);
-                        }
-                        else
-                        {
-                            ShowMessage($"تم تنفيذ التحديثات بنجاح من {currentVersion} إلى {targetVersion}", true);
-                        }
+                        //if (hasError)
+                        //{
+                        //    // إذا حدث خطأ، نحاول التراجع عن التحديثات السابقة
+                        //    if (!string.IsNullOrEmpty(backupPath))
+                        //    {
+                        //        try
+                        //        {
+                        //            backupManager.RestoreBackup(backupPath);
+                        //            ShowMessage($"حدث خطأ أثناء التحديث وتم استعادة النسخة الاحتياطية. الخطأ:", false);
+                        //        }
+                        //        catch (Exception restoreEx)
+                        //        {
+                        //            ShowMessage($"حدث خطأ أثناء التحديث وفشلت عملية استعادة النسخة الاحتياطية. الخطأ: {restoreEx.Message}", false);
+                        //        }
+                        //    }
+                        //    else
+                        //    {
+                        //        ShowMessage($"حدث خطأ أثناء التحديث: ", false);
+                        //    }
+                        //}
+                        //else
+                        //{
+                        //    ShowMessage($"تم تنفيذ التحديثات بنجاح من {currentVersion} إلى {targetVersion}", true);
+                        //}
+                        ShowMessage($"تم تنفيذ التحديثات بنجاح من {currentVersion} إلى {targetVersion}", true);
                     }
                     catch (Exception ex)
                     {
-                        RollbackUpdates(appliedScripts, conn);
-                        ShowMessage($"حدث خطأ غير متوقع: {ex.Message}", false);
+                        conn.Close();
+                        if (!string.IsNullOrEmpty(backupPath))
+                        {
+                            try
+                            {
+                                backupManager.RestoreBackup(backupPath);
+                                ShowMessage($"حدث خطأ أثناء التحديث وتم استعادة النسخة الاحتياطية. الخطأ: {ex.Message}", false);
+                            }
+                            catch (Exception restoreEx)
+                            {
+                                ShowMessage($"حدث خطأ أثناء التحديث وفشلت عملية استعادة النسخة الاحتياطية. الخطأ: {restoreEx.Message}", false);
+                            }
+                        }
+                        else
+                        {
+                            ShowMessage($"حدث خطأ أثناء التحديث: {ex.Message}", false);
+                        }
                     }
 
                     DisplayCurrentVersion();
@@ -213,6 +248,7 @@ namespace DatabaseUpdater
         {
             string scriptPath = Server.MapPath($"~/Scripts/{scriptVersion}.sql");
             string script = File.ReadAllText(scriptPath);
+
 
             // تقسيم السكربت إلى أوامر منفصلة
             IEnumerable<string> commands = SplitSqlStatements(script);
@@ -253,67 +289,135 @@ namespace DatabaseUpdater
             }
         }
 
-        private void RollbackUpdates(List<ScriptHistory> appliedScripts, SqlConnection conn)
+        private class DatabaseBackupManager
         {
-            foreach (var script in appliedScripts.OrderByDescending(s => s.Version))
+            private readonly string connectionString;
+            private readonly string backupPath;
+
+            public DatabaseBackupManager(string connectionString)
             {
-                try
+                this.connectionString = connectionString;
+                this.backupPath = Path.Combine("C:\\", "Backups");
+                if (!Directory.Exists(backupPath))
                 {
-                    string rollbackScript = GetRollbackScript(script.Version);
-                    if (!string.IsNullOrEmpty(rollbackScript))
-                    {
-                        using (SqlTransaction transaction = conn.BeginTransaction())
-                        {
-                            try
-                            {
-                                using (SqlCommand cmd = new SqlCommand(rollbackScript, conn, transaction))
-                                {
-                                    cmd.ExecuteNonQuery();
-                                }
-                                transaction.Commit();
-                            }
-                            catch
-                            {
-                                transaction.Rollback();
-                            }
-                        }
-                    }
-                }
-                catch
-                {
-                    // تسجيل الخطأ في Log
+                    Directory.CreateDirectory(backupPath);
                 }
             }
 
-            // إعادة الإصدار إلى آخر نسخة ناجحة
-            if (appliedScripts.Any())
+            public string CreateBackup(string backupName)
             {
-                var lastSuccessfulVersion = GetLastSuccessfulVersion(conn);
-                using (SqlTransaction transaction = conn.BeginTransaction())
+                using (var connection = new SqlConnection(connectionString))
                 {
-                    try
+                    connection.Open();
+                    string dbName = connection.Database;
+                    string backupFile = Path.Combine(backupPath, $"{backupName}_{DateTime.Now:yyyyMMdd_HHmmss}.bak");
+
+                    string backupQuery = $@"
+                BACKUP DATABASE [{dbName}] 
+                TO DISK = @BackupPath
+                WITH FORMAT, 
+                     NAME = @BackupName,
+                     DESCRIPTION = 'Auto backup before update'";
+
+                    using (var command = new SqlCommand(backupQuery, connection))
                     {
-                        UpdateDatabaseVersion(lastSuccessfulVersion, conn, transaction);
-                        transaction.Commit();
+                        command.Parameters.AddWithValue("@BackupPath", backupFile);
+                        command.Parameters.AddWithValue("@BackupName", backupName);
+                        command.ExecuteNonQuery();
                     }
-                    catch
+
+                    return backupFile;
+                }
+            }
+
+            public void RestoreBackup(string backupPath)
+            {
+                using (var connection = new SqlConnection(connectionString))
+                {
+                    connection.Open();
+                    string dbName = connection.Database;
+
+                    // إغلاق كافة الاتصالات النشطة
+                    string killConnectionsQuery = $@"
+                USE master;
+                ALTER DATABASE [{dbName}] SET SINGLE_USER WITH ROLLBACK IMMEDIATE;";
+
+                    string restoreQuery = $@"
+                RESTORE DATABASE [{dbName}] 
+                FROM DISK = @BackupPath
+                WITH REPLACE;
+                ALTER DATABASE [{dbName}] SET MULTI_USER;";
+
+                    using (var command = new SqlCommand(killConnectionsQuery + restoreQuery, connection))
                     {
-                        transaction.Rollback();
+                        command.Parameters.AddWithValue("@BackupPath", backupPath);
+                        command.ExecuteNonQuery();
                     }
                 }
             }
         }
 
-        private string GetRollbackScript(string version)
-        {
-            // البحث عن ملف التراجع
-            string rollbackPath = Server.MapPath($"~/Scripts/Rollbacks/{version}_rollback.sql");
-            if (File.Exists(rollbackPath))
-            {
-                return File.ReadAllText(rollbackPath);
-            }
-            return null;
-        }
+        //private void RollbackUpdates(List<ScriptHistory> appliedScripts, SqlConnection conn)
+        //{
+        //    foreach (var script in appliedScripts.OrderByDescending(s => s.Version))
+        //    {
+        //        try
+        //        {
+        //            string rollbackScript = GetRollbackScript(script.Version);
+        //            if (!string.IsNullOrEmpty(rollbackScript))
+        //            {
+        //                using (SqlTransaction transaction = conn.BeginTransaction())
+        //                {
+        //                    try
+        //                    {
+        //                        using (SqlCommand cmd = new SqlCommand(rollbackScript, conn, transaction))
+        //                        {
+        //                            cmd.ExecuteNonQuery();
+        //                        }
+        //                        transaction.Commit();
+        //                    }
+        //                    catch
+        //                    {
+        //                        transaction.Rollback();
+        //                    }
+        //                }
+        //            }
+        //        }
+        //        catch
+        //        {
+        //            // تسجيل الخطأ في Log
+        //        }
+        //    }
+
+        //    // إعادة الإصدار إلى آخر نسخة ناجحة
+        //    if (appliedScripts.Any())
+        //    {
+        //        var lastSuccessfulVersion = GetLastSuccessfulVersion(conn);
+        //        using (SqlTransaction transaction = conn.BeginTransaction())
+        //        {
+        //            try
+        //            {
+        //                UpdateDatabaseVersion(lastSuccessfulVersion, conn, transaction);
+        //                transaction.Commit();
+        //            }
+        //            catch
+        //            {
+        //                transaction.Rollback();
+        //            }
+        //        }
+        //    }
+        //}
+
+        //private string GetRollbackScript(string version)
+        //{
+        //    // البحث عن ملف التراجع
+        //    string rollbackPath = Server.MapPath($"~/Scripts/Rollbacks/{version}_rollback.sql");
+        //    if (File.Exists(rollbackPath))
+        //    {
+        //        return File.ReadAllText(rollbackPath);
+        //    }
+        //    return null;
+        //}
 
         private string GetLastSuccessfulVersion(SqlConnection conn)
         {
